@@ -6,40 +6,106 @@ import numpy as np
 import matplotlib.pyplot as plt
 from time import time
 
-#Convolutional neural net
-class Net(nn.Module):
 
-    def __init__(self):
-        super(Net, self).__init__()
+def activation_func(activation):
+    return  nn.ModuleDict([
+        ['relu', nn.ReLU(inplace=True)],
+        ['leaky_relu', nn.LeakyReLU(negative_slope=0.01, inplace=True)],
+        ['selu', nn.SELU(inplace=True)],
+        ['none', nn.Identity()]
+    ])[activation]
 
-        self.conv1 = nn.Conv1d(1, 64, 9, padding=4)
-        self.conv2 = nn.Conv1d(64, 64, 9, padding=4)
-        self.conv3 = nn.Conv1d(64, 128, 9, padding=4)
-        self.conv4 = nn.Conv1d(128, 128, 9, padding=4)
-        self.conv5 = nn.Conv1d(128, 256, 9, padding=4)
-        self.conv6 = nn.Conv1d(256, 256, 9, padding=4)
-        self.fc1 = nn.Linear(9472, 1024)
-        #self.fc2 = nn.Linear(1024, 1024)
-        # self.fc3 = nn.Linear(1024, 1024)
-        # self.fc4 = nn.Linear(1024, 1024)
-        self.fc5 = nn.Linear(1024, 11)  
+#Convolution block wrapper, autopadding
+class convblk(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, activation='none'):
+        super().__init__()
+        self.in_channels, self.out_channels, self.kernel_size, self.stride = in_channels, out_channels, kernel_size, stride
+        self.convolute = nn.Conv2d(self.in_channels, self.out_channels, self.kernel_size, self.stride, self.kernel_size//2)
+        self.activate = activation_func(activation)
+        self.batchnorm = nn.BatchNorm2d(self.out_channels)
         
     def forward(self, x):
-
-        x = F.leaky_relu(self.conv1(x))
-        x = F.max_pool1d(F.leaky_relu(self.conv2(x)), 3)
-        x = F.leaky_relu(self.conv3(x))
-        x = F.max_pool1d(F.leaky_relu(self.conv4(x)), 2)
-        x = F.leaky_relu(self.conv5(x))
-        x = F.avg_pool1d(F.leaky_relu(self.conv6(x)), 2)
-        x = x.view(-1, self.num_flat_features(x)) 
-        x = F.leaky_relu(self.fc1(x))
-        #x = F.leaky_relu(self.fc2(x))
-        # x = F.leaky_relu(self.fc3(x))
-        # x = F.leaky_relu(self.fc4(x))
-        x = self.fc5(x)
+        x = self.convolute(x)
+        x = self.activate(x)
+        x = self.batchnorm(x)
         return x
 
+class deconvblk(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, activation='none'):
+        super().__init__()
+        self.in_channels, self.out_channels, self.kernel_size, self.stride = in_channels, out_channels, kernel_size, stride
+        self.convolute = nn.ConvTranspose2d(self.in_channels, self.out_channels, self.kernel_size, self.stride, self.kernel_size//2)
+        self.activate = activation_func(activation)
+        self.batchnorm = nn.BatchNorm2d(self.out_channels)
+        
+    def forward(self, x):
+        x = self.convolute(x)
+        x = self.activate(x)
+        x = self.batchnorm(x)
+        return x
+
+class resblk(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, activation='none'):
+        super().__init__()
+        self.in_channels, self.out_channels, self.kernel_size, self.stride = in_channels, out_channels, kernel_size, stride
+        self.convolute1 = nn.Conv2d(self.in_channels, self.out_channels, self.kernel_size, self.stride, self.kernel_size//2)
+        self.convolute2 = nn.Conv2d(self.out_channels, self.out_channels, self.kernel_size, 1, self.kernel_size//2)
+        self.activate1 = activation_func(activation)
+        self.activate2 = activation_func(activation)
+        self.batchnorm1 = nn.BatchNorm2d(self.in_channels)
+        self.batchnorm2 = nn.BatchNorm2d(self.out_channels)
+        self.propagate = nn.Conv2d(self.in_channels, self.out_channels, 1, self.stride, bias=False)
+        self.batchnorm3 = nn.BatchNorm2d(self.in_channels)
+    def forward(self, x):
+        res = self.batchnorm3(x)
+        res = self.propagate(res)
+        x = self.batchnorm1(x)
+        x = self.activate1(x)
+        x = self.convolute1(x)
+        x = self.batchnorm2(x)
+        x = self.activate2(x)
+        x = self.convolute2(x)
+        x += res
+        return x
+
+
+class audioSepLayer(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, depth=1, block=resblk, activation='none'):
+        super().__init__()
+        self.in_channels, self.out_channels = in_channels, out_channels
+        self.blocks = nn.Sequential(block(in_channels, out_channels, kernel_size, stride, activation),\
+            *[block(out_channels, out_channels, kernel_size, 1, activation) for _ in range(depth - 1)])
+      
+    def forward(self, x):
+        x = self.blocks(x)
+            
+        return x
+        
+#Sensitive Paramaters
+CHANNEL_SCALE = 64
+ACTIVATION = 'relu'
+#Audio Seperation Network
+class audioSep(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layer1 = audioSepLayer(1, 1, 1, 1, 1, activation=ACTIVATION)
+        self.layer2 = audioSepLayer(1, CHANNEL_SCALE, 7, 4, 3, activation=ACTIVATION)
+        self.layer3 = audioSepLayer(CHANNEL_SCALE, CHANNEL_SCALE*2, 5, 3, 3, activation=ACTIVATION)
+        self.layer4 = audioSepLayer(CHANNEL_SCALE*2, CHANNEL_SCALE*4, 5, 3, 3, activation=ACTIVATION)
+        self.pool = nn.AvgPool2d(4,4)
+        self.fc1 = nn.Linear(1024, 257)
+
+    def forward(self, x):
+        x = x[:,None]
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+        x = self.pool(x)
+        x = x.view(-1, self.num_flat_features(x))
+        x = self.fc1(x)
+        return(x)
+    
     def num_flat_features(self, x):
         size = x.size()[1:] 
         num_features = 1
@@ -47,37 +113,6 @@ class Net(nn.Module):
             num_features *= s
         return num_features
 
-BROADCAST_CHANNELS = 8
-class Net2d(nn.Module):
-
-    def __init__(self):
-        super(Net2d, self).__init__()
-        self.conv1 = nn.Conv2d(1, BROADCAST_CHANNELS, 1)
-        self.conv2 = nn.Conv2d(BROADCAST_CHANNELS, BROADCAST_CHANNELS, 7, (1,3), (3,0))
-        self.conv3 = nn.Conv2d(BROADCAST_CHANNELS, BROADCAST_CHANNELS, 7, (1,3), (3,0))
-        self.conv4 = nn.Conv2d(BROADCAST_CHANNELS, BROADCAST_CHANNELS, 7, (1,3), (3,0))
-        self.conv5 = nn.Conv2d(BROADCAST_CHANNELS, 1, 1)
-        self.pool = nn.AvgPool2d((1,10),(1,10))
-        self.fc = nn.Linear(513, 513)
-        
-        
-    def forward(self, x):
-        x = x[:,None]
-        x = F.relu(self.conv1(x))
-        x = F.relu(self.conv2(x))
-        x = F.relu(self.conv3(x))
-        x = F.relu(self.conv4(x))
-        x = F.relu(self.conv5(x))
-        x = self.pool(x)
-        x = x.view(-1, self.num_flat_features(x))
-        return x
-
-    def num_flat_features(self, x):
-        size = x.size()[1:]  # all dimensions except the batch dimension
-        num_features = 1
-        for s in size:
-            num_features *= s
-        return num_features
 
 #Loss function
 class LogCoshLoss(torch.nn.Module):
@@ -85,19 +120,19 @@ class LogCoshLoss(torch.nn.Module):
         super().__init__()
 
     def forward(self, y_t, y_prime_t):
-        ey_t = y_t - y_prime_t
+        ey_t = 10* (y_t - y_prime_t)
         return torch.mean(torch.log(torch.cosh(ey_t)))
 
 
-#High level API for NN
-def learn(net, optimizer, X, y, batch_size = 50, device='cpu'):
-
+def learn(net, optimizer, X, y, batch_size=50, device='cpu'):
 
     torch.backends.cudnn.fastest = True
     calc = LogCoshLoss()
+    net.train()
     totalloss=0
     indicies = torch.randperm(len(X))
-    for batch in range(np.int(np.floor(len(X)/batch_size))):
+    batches = np.int(np.floor(len(X)/batch_size))
+    for batch in range(batches):
             optimizer.zero_grad()
             tx = X[indicies[batch*batch_size:(batch+1)*batch_size]].to(device)
             ty = y[indicies[batch*batch_size:(batch+1)*batch_size]].to(device)
@@ -106,23 +141,22 @@ def learn(net, optimizer, X, y, batch_size = 50, device='cpu'):
             totalloss += loss.detach()
             loss.backward()
             optimizer.step()
+    loss = totalloss/batches
+    return loss.item()
 
-    losses = totalloss/y.size(0) * batch_size * y.size(1)
-    return losses.item()
-
-def test(model, X, y, batch_size = 50, device='cpu'):
+def test(net, X, y, batch_size=50, device='cpu'):
 
     calc = LogCoshLoss()
-    model.eval()
-    indicies = torch.randperm(len(X))
-    pred = torch.zeros_like(y)
-
-    for batch in range(np.int(np.floor(len(X)/batch_size))):
-        tx = X[indicies[batch*batch_size:(batch+1)*batch_size]].to(device)
-        pred[indicies[batch*batch_size:(batch+1)*batch_size]] = model(tx).detach().cpu()
-    
-    loss = calc(pred,y).detach().numpy() * y.size(1)
-    return loss
+    net.eval()
+    totalloss=0
+    batches = np.int(np.floor(len(X)/batch_size))
+    for batch in range(batches):
+        tx = X[batch*batch_size:(batch+1)*batch_size].to(device)
+        ty = y[batch*batch_size:(batch+1)*batch_size].to(device)
+        pred = net(tx)
+        totalloss += calc(pred, ty).detach()
+    loss = totalloss/batches
+    return loss.item()
 
 from IPython import display
 def plot_train(trainloss, testloss):
@@ -136,7 +170,6 @@ def plot_train(trainloss, testloss):
     #display.clear_output(wait=True)
 
 
-#Trains model
 def train(model, optimizer, X, y, validation_size, batch_size=100, epochs=1):
 
     #Use cuda if available
@@ -151,23 +184,21 @@ def train(model, optimizer, X, y, validation_size, batch_size=100, epochs=1):
     trainX = X[ind[validation_size:]]
     trainy = y[ind[validation_size:]]
 
-    #Training
+
     print("Starting Training:")
     trainloss = []
     validation_loss = []
     plt.ion()
     start = time()
-    
     epoch = 0
-    # epoch = 
     for i in range(epochs):
         trainloss.append(learn(model, optimizer, trainX, trainy, batch_size=batch_size, device=device))
+        validation_loss.append(test(model, validationX, validationy, batch_size=batch_size, device=device))
         elapsed = time() - start
-        loss = test(model, validationX, validationy, batch_size=batch_size, device=device)
-        validation_loss.append(loss)
         print("Epoch:", i+1)
         print("Train loss:", trainloss[i])
         print("validation loss:", validation_loss[i])
         print("Time:", elapsed)
         plot_train(trainloss,validation_loss)
         epoch += 1
+
